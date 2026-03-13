@@ -1,18 +1,25 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 import os
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
+import logging
 
 from app.detector import detect_objects, capture_from_webcam
 from app.database import (
-    save_detection, get_latest, get_history, 
+    save_detection, 
+    get_latest, 
+    get_history, 
+    get_statistics,
     get_detection_by_sequence
 )
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configuration
 UPLOAD_FOLDER = "uploads"
@@ -31,11 +38,11 @@ capture_task = None
 async def lifespan(app: FastAPI):
     global capture_task
     capture_task = asyncio.create_task(periodic_capture())
-    print("🚀 Periodic capture started (every 20 seconds)")
+    logger.info("🚀 Periodic capture started (every 20 seconds)")
     yield
     if capture_task:
         capture_task.cancel()
-        print("👋 Periodic capture stopped")
+        logger.info("👋 Periodic capture stopped")
 
 app = FastAPI(
     title="SafeV Camera System",
@@ -61,7 +68,7 @@ async def periodic_capture():
     """Background task to capture and detect every 20 seconds"""
     while True:
         try:
-            print(f"📸 Capturing at {datetime.now()}")
+            logger.info(f"📸 Capturing at {datetime.now()}")
             
             if active_source == "webcam":
                 # Capture from webcam
@@ -75,19 +82,17 @@ async def periodic_capture():
                     result["id"],
                     result["image_path"],
                     result["original_image"],
-                    result["objects"],
-                    result["counts"]["people"],
-                    result["counts"]["cars"],
-                    result["traffic_light"]
+                    result  # Pass the entire result object
                 )
                 
-                print(f"✅ Detection #{result['id']} complete")
-                print(f"   Traffic Light: {result['traffic_light']['color']}")
-                if result['traffic_light']['countdown']:
-                    print(f"   Countdown: {result['traffic_light']['countdown']}s")
+                logger.info(f"✅ Detection #{result['id']} complete")
+                if result['traffic_light']['detected']:
+                    logger.info(f"   Traffic Light: {result['traffic_light']['color']}")
+                    if result['traffic_light']['countdown']:
+                        logger.info(f"   Countdown: {result['traffic_light']['countdown']}s")
                 
         except Exception as e:
-            print(f"❌ Periodic capture error: {e}")
+            logger.error(f"❌ Periodic capture error: {str(e)}")
         
         await asyncio.sleep(CAPTURE_INTERVAL)
 
@@ -97,7 +102,15 @@ async def root():
         "name": "SafeV Traffic Light Detection",
         "version": "1.0.0",
         "capture_interval": f"{CAPTURE_INTERVAL} seconds",
-        "active_source": active_source
+        "active_source": active_source,
+        "endpoints": {
+            "GET /": "This info",
+            "GET /webcam/capture": "Manual capture",
+            "GET /latest": "Latest detection",
+            "GET /history": "Detection history",
+            "GET /stats": "Statistics",
+            "GET /detection/{seq_num}": "Get detection by sequence number"
+        }
     }
 
 @app.get("/webcam/capture")
@@ -111,15 +124,17 @@ async def webcam_capture():
             result["id"],
             result["image_path"],
             result["original_image"],
-            result["objects"],
-            result["counts"]["people"],
-            result["counts"]["cars"],
-            result["traffic_light"]
+            result
         )
+        
+        # Add URLs for frontend
+        result["image_url"] = f"/detections/{result['id']}.jpg"
+        result["original_url"] = f"/uploads/{result['id']}.jpg"
         
         return result
     
     except Exception as e:
+        logger.error(f"Manual capture failed: {str(e)}")
         raise HTTPException(500, f"Capture failed: {str(e)}")
 
 @app.get("/latest")
@@ -131,8 +146,8 @@ async def latest_detection():
         return {"message": "No detections yet"}
     
     # Add URLs
-    detection["image_url"] = f"/{detection['image_path']}"
-    detection["original_url"] = f"/{detection['original_image']}"
+    detection["image_url"] = f"/detections/{detection['sequence_number']}.jpg"
+    detection["original_url"] = f"/uploads/{detection['sequence_number']}.jpg"
     
     return detection
 
@@ -142,8 +157,8 @@ async def detection_history(limit: int = 50):
     history = get_history(limit)
     
     for item in history:
-        item["image_url"] = f"/{item['image_path']}"
-        item["original_url"] = f"/{item['original_image']}"
+        item["image_url"] = f"/detections/{item['sequence_number']}.jpg"
+        item["original_url"] = f"/uploads/{item['sequence_number']}.jpg"
     
     return {
         "total": len(history),
@@ -158,31 +173,15 @@ async def get_detection(seq_num: int):
     if detection is None:
         raise HTTPException(404, f"Detection #{seq_num} not found")
     
-    detection["image_url"] = f"/{detection['image_path']}"
-    detection["original_url"] = f"/{detection['original_image']}"
+    detection["image_url"] = f"/detections/{detection['sequence_number']}.jpg"
+    detection["original_url"] = f"/uploads/{detection['sequence_number']}.jpg"
     
     return detection
 
 @app.get("/stats")
 async def get_stats():
-    """Get quick statistics"""
-    history = get_history(1000)
-    
-    total = len(history)
-    traffic_lights = sum(1 for d in history if d['traffic_light_detected'])
-    red_lights = sum(1 for d in history if d['traffic_light_color'] == 'red')
-    green_lights = sum(1 for d in history if d['traffic_light_color'] == 'green')
-    yellow_lights = sum(1 for d in history if d['traffic_light_color'] == 'yellow')
-    
-    return {
-        "total_detections": total,
-        "traffic_lights_detected": traffic_lights,
-        "red_lights": red_lights,
-        "yellow_lights": yellow_lights,
-        "green_lights": green_lights,
-        "total_people": sum(d['person_count'] for d in history),
-        "total_cars": sum(d['car_count'] for d in history)
-    }
+    """Get detection statistics"""
+    return get_statistics()
 
 if __name__ == "__main__":
     uvicorn.run(

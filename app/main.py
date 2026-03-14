@@ -30,9 +30,11 @@ CAPTURE_INTERVAL = 20  # seconds
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(DETECTION_FOLDER, exist_ok=True)
 
-# Global variables
+# Global variables for temporal smoothing
 active_source = "webcam"
 capture_task = None
+last_countdown = None
+last_color = "unknown"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -66,6 +68,8 @@ app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 async def periodic_capture():
     """Background task to capture and detect every 20 seconds"""
+    global last_countdown, last_color
+    
     while True:
         try:
             logger.info(f"📸 Capturing at {datetime.now()}")
@@ -77,12 +81,28 @@ async def periodic_capture():
                 # Run detection
                 result = detect_objects(image_path)
                 
+                # Temporal smoothing for countdown
+                new_cd = result['traffic_light']['countdown']
+                if new_cd is not None:
+                    last_countdown = new_cd
+                    last_color = result['traffic_light']['color']
+                else:
+                    # If no countdown detected, show previous - 1 (for decrementing display)
+                    if last_countdown is not None and last_countdown > 0:
+                        last_countdown -= 1
+                        if last_countdown < 0:
+                            last_countdown = None
+                    
+                    # Update result with smoothed values
+                    result['traffic_light']['countdown'] = last_countdown
+                    result['traffic_light']['color'] = last_color if last_color != "unknown" else result['traffic_light']['color']
+                
                 # Save to database
                 save_detection(
                     result["id"],
                     result["image_path"],
                     result["original_image"],
-                    result  # Pass the entire result object
+                    result
                 )
                 
                 logger.info(f"✅ Detection #{result['id']} complete")
@@ -116,9 +136,20 @@ async def root():
 @app.get("/webcam/capture")
 async def webcam_capture():
     """Manually trigger webcam capture"""
+    global last_countdown, last_color
+    
     try:
         image_path, seq_num = capture_from_webcam()
         result = detect_objects(image_path)
+        
+        # Temporal smoothing for manual capture
+        new_cd = result['traffic_light']['countdown']
+        if new_cd is not None:
+            last_countdown = new_cd
+            last_color = result['traffic_light']['color']
+        else:
+            result['traffic_light']['countdown'] = last_countdown
+            result['traffic_light']['color'] = last_color if last_color != "unknown" else result['traffic_light']['color']
         
         save_detection(
             result["id"],
